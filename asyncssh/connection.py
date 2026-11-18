@@ -1673,7 +1673,11 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         self._inpbuf = self._inpbuf[rem:]
         self._packet = b''
 
-        orig_payload = packet_data[1:-packet_data[0]]
+        padlen = packet_data[0]
+        if padlen < 4 or padlen > len(packet_data) - 1:
+            raise ProtocolError('Invalid packet padding length')
+
+        orig_payload = packet_data[1:-padlen]
 
         if self._decompressor and (self._auth_complete or
                                    not self._decompress_after_auth):
