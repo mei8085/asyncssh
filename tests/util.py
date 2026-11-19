@@ -242,8 +242,10 @@ def make_certificate(cert_version, cert_type, key, signing_key, principals,
 
     keydata = key.encode_ssh_public()
     principals = b''.join(String(p) for p in principals)
-    options = _encode_options(options) if options else b''
-    extensions = _encode_options(extensions) if extensions else b''
+    options = _encode_options(options) if isinstance(options, dict) else \
+        options or b''
+    extensions = _encode_options(extensions) if isinstance(extensions, dict) \
+        else extensions or b''
     signing_keydata = b''.join((String(signing_key.algorithm),
                                 signing_key.encode_ssh_public()))
 

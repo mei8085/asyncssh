@@ -1759,6 +1759,8 @@ class SSHOpenSSHCertificate(SSHCertificate):
             elif critical:
                 raise KeyImportError('Unrecognized critical option: ' +
                                      name.decode('ascii', errors='replace'))
+            else:
+                packet.get_string()  # Skip value of unrecognized option
 
         return result
 

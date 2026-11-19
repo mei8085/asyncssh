@@ -1830,6 +1830,43 @@ class _TestPublicKey(TempDirTestCase):
                                          extensions={b'xxx': b''})
             self.assertIsNotNone(asyncssh.import_certificate(cert))
 
+        with self.subTest('Multiple ignored certificate extensions'):
+            cert = self.make_certificate(cert_type, self.pubkey,
+                                         self.privca, ('name',),
+                                         extensions={b'xxx': b'yyy',
+                                                     b'aaa': b'bbb'})
+            self.assertIsNotNone(asyncssh.import_certificate(cert))
+
+        if cert_type == CERT_TYPE_USER:
+            with self.subTest('Known extension after unknown extensions'):
+                cert = self.make_certificate(cert_type, self.pubkey,
+                                             self.privca, ('name',),
+                                             extensions={b'xxx': b'yyy',
+                                                         b'permit-pty': b''})
+                cert = asyncssh.import_certificate(cert)
+                self.assertTrue(cert.options['permit-pty'])
+
+            with self.subTest('Unknown extension value not decoded as name'):
+                cert = self.make_certificate(
+                    cert_type, self.pubkey, self.privca, ('name',),
+                    extensions={b'xxx': b'permit-pty', b'yyy': b''})
+                cert = asyncssh.import_certificate(cert)
+                self.assertNotIn('permit-pty', cert.options)
+
+        with self.subTest('Truncated certificate extension value'):
+            with self.assertRaises(asyncssh.KeyImportError):
+                cert = self.make_certificate(
+                    cert_type, self.pubkey, self.privca, ('name',),
+                    extensions=String(b'xxx') + UInt32(10) + b'ab')
+                asyncssh.import_certificate(cert)
+
+        with self.subTest('Truncated certificate critical option value'):
+            with self.assertRaises(asyncssh.KeyImportError):
+                cert = self.make_certificate(
+                    cert_type, self.pubkey, self.privca, ('name',),
+                    options=String(b'xxx') + UInt32(10) + b'ab')
+                asyncssh.import_certificate(cert)
+
         with self.subTest('Invalid certificate signature'):
             with self.assertRaises(asyncssh.KeyImportError):
                 cert = self.make_certificate(cert_type, self.pubkey,
