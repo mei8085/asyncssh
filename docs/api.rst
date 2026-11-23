@@ -1544,10 +1544,29 @@ path to a UNIX domain socket which can be passed as the ``SSH_AUTH_SOCK``
 to local applications which need this access. Any requests sent to this
 socket are forwarded over the SSH connection to the client's ssh-agent.
 
+When an SSH client connection uses keys held in an ssh-agent to
+authenticate, AsyncSSH will attempt to bind its agent connection to
+that SSH session using the OpenSSH ``session-bind@openssh.com``
+extension, providing the agent with the server's host key, the session
+identifier, and the server's host key signature from the initial key
+exchange. Agents which don't support this extension simply continue
+to operate without a session binding.
+
+Keys can also be added to an ssh-agent with destination constraints
+using the OpenSSH ``restrict-destination-v00@openssh.com`` key
+constraint, by passing a list of :class:`SSHAgentDestinationConstraint`
+objects to :meth:`SSHAgentClient.add_keys` or
+:meth:`SSHAgentClient.add_smartcard_keys`. Such keys can only be used
+to authenticate to the destinations listed in the constraints, and
+only from agent connections bound to an SSH session which leads to
+one of those destinations.
+
 .. autoclass:: SSHAgentClient()
 
    ===================================== =
    .. automethod:: get_keys
+   .. automethod:: sign
+   .. automethod:: bind
    .. automethod:: add_keys
    .. automethod:: add_smartcard_keys
    .. automethod:: remove_keys
@@ -1559,6 +1578,8 @@ socket are forwarded over the SSH connection to the client's ssh-agent.
    .. automethod:: close
    .. automethod:: wait_closed
    ===================================== =
+
+.. autoclass:: SSHAgentDestinationConstraint()
 
 .. autoclass:: SSHAgentKeyPair()
 

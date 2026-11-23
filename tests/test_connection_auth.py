@@ -31,12 +31,13 @@ from cryptography.exceptions import UnsupportedAlgorithm
 
 import asyncssh
 from asyncssh.misc import async_context_manager, write_file
-from asyncssh.packet import String
+from asyncssh.agent import SSH_AGENT_FAILURE
+from asyncssh.packet import Byte, String
 from asyncssh.public_key import CERT_TYPE_USER, CERT_TYPE_HOST
 
 from .keysign_stub import create_subprocess_exec_stub
 from .server import Server, ServerTestCase
-from .util import asynctest, gss_available, patch_getnameinfo
+from .util import asynctest, gss_available, patch_getnameinfo, try_remove
 from .util import patch_getnameinfo_error, patch_gss
 from .util import make_certificate, nc_available, x509_available
 
@@ -67,8 +68,47 @@ class _AsyncGSSServer(asyncssh.SSHServer):
                                               host_principal)
 
 
+class _MockAgent:
+    """Mock SSH agent which fails all requests"""
+
+    def __init__(self):
+        self._path = None
+        self._server = None
+
+    async def start(self, path):
+        """Start a new mock SSH agent"""
+
+        self._path = path
+
+        # pylint doesn't think start_unix_server exists
+        # pylint: disable=no-member
+        self._server = \
+            await asyncio.start_unix_server(self.process_request, path)
+
+    async def process_request(self, reader, writer):
+        """Process requests sent to the mock SSH agent"""
+
+        try:
+            while True:
+                msglen = int.from_bytes(await reader.readexactly(4), 'big')
+                await reader.readexactly(msglen)
+                writer.write(String(Byte(SSH_AGENT_FAILURE)))
+        except (EOFError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            writer.close()
+
+    async def stop(self):
+        """Shut down the mock SSH agent"""
+
+        self._server.close()
+        await self._server.wait_closed()
+
+        try_remove(self._path)
+
+
 class _NullServer(Server):
-    """Server for testing disabled auth"""
+    """Server for testing disabled auth"""    """Server for testing disabled auth"""
 
     async def begin_auth(self, username):
         """Handle client authentication request"""
@@ -1332,6 +1372,20 @@ class _TestPublicKeyAuth(ServerTestCase):
             with self.assertRaises(asyncssh.PermissionDenied):
                 await self.connect(username='ckey', agent_path='xxx',
                                    known_hosts='.ssh/known_hosts')
+
+    @asynctest
+    async def test_agent_bind_failure(self):
+        """Test connecting when the agent doesn't support session binding"""
+
+        mock_agent = _MockAgent()
+        await mock_agent.start('mock_agent')
+
+        try:
+            async with self.connect(username='ckey', client_keys='ckey',
+                                    agent_path='mock_agent'):
+                pass
+        finally:
+            await mock_agent.stop()
 
     @asynctest
     async def test_agent_auth_unset(self):

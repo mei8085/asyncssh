@@ -1931,6 +1931,16 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         self.send_packet(MSG_EXT_INFO, packet)
 
+    def record_kex_host_key_sig(self, sig: bytes) -> None:
+        """Record a host key signature made during key exchange
+
+           This method is a no-op on server connections. On client
+           connections, it retains the signature the server made of
+           the session ID with its host key during the initial key
+           exchange, for later use in SSH agent session binding.
+
+        """
+
     def send_newkeys(self, k: bytes, h: bytes) -> None:
         """Finish a key exchange and send a new keys message"""
 
@@ -3477,6 +3487,7 @@ class SSHClientConnection(SSHConnection):
 
         self._server_host_key_algs: Optional[Sequence[bytes]] = None
         self._server_host_key: Optional[SSHKey] = None
+        self._kex_host_key_sig: Optional[bytes] = None
 
         self._server_host_keys_handler = options.server_host_keys_handler
 
@@ -3681,6 +3692,32 @@ class SSHClientConnection(SSHConnection):
 
         return self._server_host_key
 
+    def record_kex_host_key_sig(self, sig: bytes) -> None:
+        """Record the host key signature from the initial key exchange
+
+           This retains the signature the server made of the session
+           ID with its host key during the initial key exchange, for
+           later use in binding the SSH agent to this session.
+
+        """
+
+        if not self._session_id:
+            self._kex_host_key_sig = sig
+
+    async def _bind_agent(self) -> None:
+        """Bind the SSH agent connection to this SSH session"""
+
+        assert self._agent is not None
+
+        if self._kex_host_key_sig and self._server_host_key:
+            try:
+                await self._agent.bind(self._server_host_key.public_data,
+                                       self._session_id,
+                                       self._kex_host_key_sig, False)
+            except ValueError:
+                self.logger.debug2('SSH agent does not support session '
+                                   'binding')
+
     def get_server_auth_methods(self) -> Sequence[str]:
         """Return the server host key used in the key exchange
 
@@ -3794,6 +3831,8 @@ class SSHClientConnection(SSHConnection):
 
         if self._get_agent_keys:
             assert self._agent is not None
+
+            await self._bind_agent()
 
             try:
                 agent_keys = await self._agent.get_keys(self._agent_identities)

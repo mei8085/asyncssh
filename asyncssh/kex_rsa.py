@@ -161,6 +161,7 @@ class _KexRSA(Kex):
         if not host_key.verify(h, sig):
             raise KeyExchangeFailed('Key exchange hash mismatch')
 
+        self._conn.record_kex_host_key_sig(sig)
         self._conn.send_newkeys(MPInt(self._k), h)
 
     _packet_handlers = {

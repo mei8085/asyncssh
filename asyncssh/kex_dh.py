@@ -241,6 +241,7 @@ class _KexDHBase(Kex):
         if not key.verify(h, sig):
             raise KeyExchangeFailed('Key exchange hash mismatch')
 
+        self._conn.record_kex_host_key_sig(sig)
         self._conn.send_newkeys(k, h)
 
     def _process_init(self, _pkttype: int, _pktid: int,

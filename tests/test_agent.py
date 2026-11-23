@@ -31,9 +31,10 @@ import unittest
 import asyncssh
 
 from asyncssh.agent import SSH_AGENT_SUCCESS, SSH_AGENT_FAILURE
-from asyncssh.agent import SSH_AGENT_IDENTITIES_ANSWER
+from asyncssh.agent import SSH_AGENT_IDENTITIES_ANSWER, SSH_AGENT_EXTENSION_FAILURE
+from asyncssh.agent import SSH_AGENTC_ADD_ID_CONSTRAINED
 from asyncssh.crypto import ed25519_available
-from asyncssh.packet import Byte, String, UInt32
+from asyncssh.packet import Boolean, Byte, String, UInt32
 
 from .sk_stub import sk_available, patch_sk
 from .util import AsyncTestCase, asynctest, get_test_key, run, try_remove
@@ -61,6 +62,7 @@ class _Agent:
         self._response = b'' if response is None else String(response)
         self._path = None
         self._server = None
+        self.requests = []
 
     async def start(self, path):
         """Start a new mock SSH agent"""
@@ -75,7 +77,8 @@ class _Agent:
     async def process_request(self, reader, writer):
         """Process a request sent to the mock SSH agent"""
 
-        await reader.readexactly(4)
+        msglen = int.from_bytes(await reader.readexactly(4), 'big')
+        self.requests.append(await reader.readexactly(msglen))
         writer.write(self._response)
         writer.close()
 
@@ -453,6 +456,289 @@ class _TestAgent(AsyncTestCase):
         await mock_agent.stop()
 
     @agent_test
+    async def test_bind(self, agent):
+        """Test binding the agent connection to an SSH session"""
+
+        key = get_test_key('ssh-rsa')
+        pubkey = key.convert_to_public()
+
+        # A valid binding should be accepted, but a connection bound
+        # for authentication can't be bound again
+        session_id = os.urandom(32)
+        sig = key.sign(session_id, key.sig_algorithms[0])
+
+        async with agent:
+            self.assertIsNone(await agent.bind(pubkey.public_data,
+                                               session_id, sig, False))
+
+            with self.assertRaises(ValueError):
+                await agent.bind(pubkey.public_data, session_id, sig, False)
+
+        # A binding with an invalid signature should be rejected
+        async with agent:
+            with self.assertRaises(ValueError):
+                await agent.bind(pubkey.public_data, os.urandom(32),
+                                 sig, False)
+
+        # Multiple forwarding bindings are allowed on one connection
+        async with agent:
+            for _ in range(2):
+                session_id = os.urandom(32)
+                sig = key.sign(session_id, key.sig_algorithms[0])
+
+                self.assertIsNone(await agent.bind(pubkey.public_data,
+                                                   session_id, sig, True))
+
+    @agent_test
+    async def test_bind_with_cert(self, agent):
+        """Test binding the agent connection using a host certificate"""
+
+        key = get_test_key('ssh-rsa')
+        ca_key = get_test_key('ecdsa-sha2-nistp256')
+        cert = ca_key.generate_host_certificate(key, 'host')
+
+        # The host key signature is made by the host's private key,
+        # but the binding is recorded against the certificate
+        session_id = os.urandom(32)
+        sig = key.sign(session_id, key.sig_algorithms[0])
+
+        async with agent:
+            self.assertIsNone(await agent.bind(cert.public_data,
+                                               session_id, sig, False))
+
+    @asynctest
+    async def test_bind_errors(self):
+        """Test error responses when binding an agent connection"""
+
+        key = get_test_key('ssh-rsa')
+
+        for response in (Byte(SSH_AGENT_FAILURE),
+                         Byte(SSH_AGENT_EXTENSION_FAILURE),
+                         b'\xff'):
+            mock_agent = _Agent(response)
+            await mock_agent.start('mock_agent')
+
+            async with asyncssh.connect_agent('mock_agent') as agent:
+                with self.assertRaises(ValueError):
+                    await agent.bind(key.public_data, b'xxx', b'xxx', False)
+
+            await mock_agent.stop()
+
+        mock_agent = _Agent(Byte(SSH_AGENT_SUCCESS))
+        await mock_agent.start('mock_agent')
+
+        async with asyncssh.connect_agent('mock_agent') as agent:
+            self.assertIsNone(await agent.bind(key.public_data, b'xxx',
+                                               b'xxx', False))
+
+        await mock_agent.stop()
+
+    @asynctest
+    async def test_destination_constraint_validation(self):
+        """Test validation of destination constraints"""
+
+        key = get_test_key('ssh-rsa').convert_to_public()
+
+        # A destination host is required
+        with self.assertRaises(ValueError):
+            asyncssh.SSHAgentDestinationConstraint('', [key])
+
+        # At least one destination host key or CA key is required
+        with self.assertRaises(ValueError):
+            asyncssh.SSHAgentDestinationConstraint('host')
+
+        # A from host can't be specified without from host keys
+        with self.assertRaises(ValueError):
+            asyncssh.SSHAgentDestinationConstraint('host', [key],
+                                                   from_host='from')
+
+        # From host keys can't be specified without a from host
+        with self.assertRaises(ValueError):
+            asyncssh.SSHAgentDestinationConstraint('host', [key],
+                                                   from_host_keys=[key])
+
+        constraint = asyncssh.SSHAgentDestinationConstraint('host', [key])
+        self.assertIsNotNone(constraint.encode())
+
+    @asynctest
+    async def test_destination_constraint_encode(self):
+        """Test encoding of destination constraints"""
+
+        key = get_test_key('ssh-rsa').convert_to_public()
+        ca_key = get_test_key('ecdsa-sha2-nistp256').convert_to_public()
+
+        constraint = asyncssh.SSHAgentDestinationConstraint(
+            'tohost', [key], [ca_key], to_user='touser', from_host='fromhost',
+            from_host_keys=[key], from_host_ca_keys=[ca_key])
+
+        from_hop = (String('') + String('fromhost') + String(b'') +
+                    String(key.public_data) + Boolean(False) +
+                    String(ca_key.public_data) + Boolean(True))
+        to_hop = (String('touser') + String('tohost') + String(b'') +
+                  String(key.public_data) + Boolean(False) +
+                  String(ca_key.public_data) + Boolean(True))
+
+        self.assertEqual(constraint.encode(),
+                         String(String(from_hop) + String(to_hop) +
+                                String(b'')))
+
+    @agent_test
+    async def test_add_keys_with_destinations(self, agent):
+        """Test adding keys with destination constraints"""
+
+        key = get_test_key('ssh-rsa')
+        host_key = get_test_key('ssh-rsa', 1).convert_to_public()
+        ca_key = get_test_key('ecdsa-sha2-nistp256').convert_to_public()
+
+        destinations = [
+            asyncssh.SSHAgentDestinationConstraint('dest', [host_key]),
+            asyncssh.SSHAgentDestinationConstraint(
+                'dest2', [], [ca_key], to_user='user', from_host='from',
+                from_host_keys=[host_key])
+        ]
+
+        await agent.add_keys([key], destinations=destinations)
+
+        agent_keys = await agent.get_keys()
+        self.assertEqual(len(agent_keys), 1)
+
+        # Destination-constrained keys can't sign on unbound connections
+        with self.assertRaises(ValueError):
+            await agent_keys[0].sign_async(b'test')
+
+        await agent.remove_keys(agent_keys)
+
+    @agent_test
+    async def test_sign_with_destinations(self, agent):
+        """Test signing with a destination-constrained key"""
+
+        key = get_test_key('ssh-rsa')
+        pubkey = key.convert_to_public()
+        host_key = get_test_key('ssh-rsa', 1)
+        host_pubkey = host_key.convert_to_public()
+
+        destinations = [asyncssh.SSHAgentDestinationConstraint(
+            'dest', [host_pubkey], to_user='user')]
+
+        await agent.add_keys([key], destinations=destinations)
+
+        session_id = os.urandom(32)
+        session_sig = host_key.sign(session_id,
+                                    host_key.sig_algorithms[0])
+
+        await agent.bind(host_pubkey.public_data, session_id,
+                         session_sig, False)
+
+        # A host-bound auth request for a permitted destination
+        # should be signed
+        data = (String(session_id) + Byte(50) + String('user') +
+                String('ssh-connection') +
+                String('publickey-hostbound-v00@openssh.com') +
+                Byte(1) + String('ssh-rsa') + String(pubkey.public_data) +
+                String(host_pubkey.public_data))
+
+        sig = await agent.sign(pubkey.public_data, data)
+        self.assertTrue(pubkey.verify(data, sig))
+
+        # Signing data which isn't a host-bound auth request for a
+        # permitted destination should be refused
+        with self.assertRaises(ValueError):
+            await agent.sign(pubkey.public_data, b'test')
+
+        # Signing for a user not permitted by the constraint should
+        # be refused
+        bad_data = (String(session_id) + Byte(50) + String('other') +
+                    String('ssh-connection') +
+                    String('publickey-hostbound-v00@openssh.com') +
+                    Byte(1) + String('ssh-rsa') +
+                    String(pubkey.public_data) +
+                    String(host_pubkey.public_data))
+
+        with self.assertRaises(ValueError):
+            await agent.sign(pubkey.public_data, bad_data)
+
+        await agent.remove_keys(await agent.get_keys())
+
+    @agent_test
+    async def test_sign_with_destinations_wrong_host(self, agent):
+        """Test signing with a destination-constrained key on the wrong host"""
+
+        key = get_test_key('ssh-rsa')
+        pubkey = key.convert_to_public()
+        host_key = get_test_key('ssh-rsa', 1)
+        host_pubkey = host_key.convert_to_public()
+        other_host_key = get_test_key('ssh-rsa', 2)
+        other_host_pubkey = other_host_key.convert_to_public()
+
+        destinations = [asyncssh.SSHAgentDestinationConstraint(
+            'dest', [host_pubkey])]
+
+        await agent.add_keys([key], destinations=destinations)
+
+        # Bind the connection to a host not listed in the constraint
+        session_id = os.urandom(32)
+        session_sig = other_host_key.sign(
+            session_id, other_host_key.sig_algorithms[0])
+
+        await agent.bind(other_host_pubkey.public_data, session_id,
+                         session_sig, False)
+
+        data = (String(session_id) + Byte(50) + String('user') +
+                String('ssh-connection') +
+                String('publickey-hostbound-v00@openssh.com') +
+                Byte(1) + String('ssh-rsa') + String(pubkey.public_data) +
+                String(other_host_pubkey.public_data))
+
+        with self.assertRaises(ValueError):
+            await agent.sign(pubkey.public_data, data)
+
+        await agent.remove_keys(await agent.get_keys())
+
+    @asynctest
+    async def test_add_keys_with_destinations_encoding(self):
+        """Test the encoding of add key requests with destinations"""
+
+        key = get_test_key('ssh-rsa')
+        host_key = get_test_key('ssh-rsa', 1).convert_to_public()
+
+        destinations = [asyncssh.SSHAgentDestinationConstraint(
+            'dest', [host_key])]
+
+        mock_agent = _Agent(Byte(SSH_AGENT_SUCCESS))
+        await mock_agent.start('mock_agent')
+
+        async with asyncssh.connect_agent('mock_agent') as agent:
+            await agent.add_keys([key], destinations=destinations)
+
+        request = mock_agent.requests[0]
+        self.assertEqual(request[0], SSH_AGENTC_ADD_ID_CONSTRAINED)
+        self.assertTrue(request.endswith(destinations[0].encode()))
+
+        await mock_agent.stop()
+
+    @asynctest
+    async def test_add_smartcard_keys_with_destinations(self):
+        """Test adding smart card keys with destination constraints"""
+
+        host_key = get_test_key('ssh-rsa', 1).convert_to_public()
+
+        destinations = [asyncssh.SSHAgentDestinationConstraint(
+            'dest', [host_key])]
+
+        mock_agent = _Agent(Byte(SSH_AGENT_SUCCESS))
+        await mock_agent.start('mock_agent')
+
+        async with asyncssh.connect_agent('mock_agent') as agent:
+            result = await agent.add_smartcard_keys('provider',
+                                                    destinations=destinations)
+            self.assertIsNone(result)
+
+        self.assertTrue(mock_agent.requests[0].endswith(
+            destinations[0].encode()))
+
+        await mock_agent.stop()
+
+    @agent_test
     async def test_unknown_key(self, agent):
         """Test failure when signing with an unknown key"""
 
@@ -482,6 +768,7 @@ class _TestAgent(AsyncTestCase):
             async with asyncssh.connect_agent('mock_agent') as agent:
                 for request in (agent.get_keys(),
                                 agent.sign(b'xxx', b'test'),
+                                agent.bind(b'xxx', b'xxx', b'xxx', False),
                                 agent.add_keys([key]),
                                 agent.add_smartcard_keys('xxx'),
                                 agent.remove_keys([keypair]),

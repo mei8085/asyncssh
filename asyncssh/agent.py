@@ -30,8 +30,8 @@ from typing_extensions import Self
 
 from .listener import SSHForwardListener
 from .misc import async_context_manager, maybe_wait_closed
-from .packet import Byte, String, UInt32, PacketDecodeError, SSHPacket
-from .public_key import KeyPairListArg, SSHCertificate, SSHKeyPair
+from .packet import Boolean, Byte, String, UInt32, PacketDecodeError, SSHPacket
+from .public_key import KeyPairListArg, SSHCertificate, SSHKey, SSHKeyPair
 from .public_key import load_default_keypairs, load_keypairs
 
 if TYPE_CHECKING:
@@ -103,6 +103,134 @@ SSH_AGENT_CONSTRAIN_EXTENSION            = 255
 # SSH agent signature flags
 SSH_AGENT_RSA_SHA2_256                   = 2
 SSH_AGENT_RSA_SHA2_512                   = 4
+
+# SSH agent extension names
+SSH_AGENT_SESSION_BIND                   = 'session-bind@openssh.com'
+SSH_AGENT_DESTINATION_CONSTRAINT         = \
+    'restrict-destination-v00@openssh.com'
+
+
+class SSHAgentDestinationConstraint:
+    """A destination constraint for keys stored in an SSH agent
+
+       This class encapsulates the OpenSSH
+       ``restrict-destination-v00@openssh.com`` key constraint, which
+       restricts a key added to an SSH agent so it can only be used to
+       authenticate to a specific set of destination hosts, potentially
+       limited to connections arriving from a specific set of
+       intermediate ("from") hosts.
+
+       Destinations are identified by their host public keys, not by
+       host name, so that the restriction is anchored in a cryptographic
+       identity which the SSH agent can verify against the host key
+       used in the SSH session the key is used from. Host certificates
+       are supported by specifying the CA key which signed them as a
+       CA key (see below) -- the certificate must then also list the
+       destination host name as a valid principal.
+
+       At least one destination host and one destination host key (or
+       CA key) must be provided. If a "from" host is specified, at
+       least one "from" host key (or CA key) must also be provided,
+       and vice versa. When no "from" host is given, the constraint
+       only matches the initial hop from the host running the SSH
+       agent.
+
+       :param to_host:
+           The host name of the destination this constraint applies to
+       :param to_host_keys: (optional)
+           The set of public keys the destination host is allowed to
+           authenticate with
+       :param to_host_ca_keys: (optional)
+           The set of CA keys whose signatures on a host certificate
+           the destination host is allowed to authenticate with
+       :param to_user: (optional)
+           The remote user name this constraint applies to, defaulting
+           to matching any user
+       :param from_host: (optional)
+           The host name of the intermediate host connections must
+           arrive from, defaulting to the host running the SSH agent
+       :param from_host_keys: (optional)
+           The set of public keys the intermediate host is allowed to
+           authenticate with
+       :param from_host_ca_keys: (optional)
+           The set of CA keys whose signatures on a host certificate
+           the intermediate host is allowed to authenticate with
+       :type to_host: `str`
+       :type to_host_keys: list of :class:`SSHKey`
+       :type to_host_ca_keys: list of :class:`SSHKey`
+       :type to_user: `str`
+       :type from_host: `str`
+       :type from_host_keys: list of :class:`SSHKey`
+       :type from_host_ca_keys: list of :class:`SSHKey`
+
+       :raises: :exc:`ValueError` if the constraint is incomplete or
+                internally inconsistent
+
+    """
+
+    def __init__(self, to_host: str, to_host_keys: Sequence[SSHKey] = (),
+                 to_host_ca_keys: Sequence[SSHKey] = (), *,
+                 to_user: str = '', from_host: str = '',
+                 from_host_keys: Sequence[SSHKey] = (),
+                 from_host_ca_keys: Sequence[SSHKey] = ()):
+        if not to_host:
+            raise ValueError('Destination constraint requires a '
+                             'destination host')
+
+        if not to_host_keys and not to_host_ca_keys:
+            raise ValueError('Destination constraint requires at least '
+                             'one destination host key or CA key')
+
+        if bool(from_host) != bool(from_host_keys or from_host_ca_keys):
+            raise ValueError('From host and from host keys must be '
+                             'specified together')
+
+        self._to_host = to_host
+        self._to_host_keys = to_host_keys
+        self._to_host_ca_keys = to_host_ca_keys
+        self._to_user = to_user
+        self._from_host = from_host
+        self._from_host_keys = from_host_keys
+        self._from_host_ca_keys = from_host_ca_keys
+
+    @staticmethod
+    def _encode_hop(user: str, host: str, keys: Sequence[SSHKey],
+                    ca_keys: Sequence[SSHKey]) -> bytes:
+        """Encode one hop of a destination constraint"""
+
+        return (String(user) + String(host) + String(b'') +
+                b''.join(String(key.public_data) + Boolean(False)
+                         for key in keys) +
+                b''.join(String(key.public_data) + Boolean(True)
+                         for key in ca_keys))
+
+    def encode(self) -> bytes:
+        """Encode this destination constraint as an agent key constraint
+
+           :returns: The encoded constraint, ready to be included in
+                     the constraint list of a
+                     ``restrict-destination-v00@openssh.com`` constraint
+                     extension
+
+        """
+
+        from_hop = self._encode_hop('', self._from_host,
+                                    self._from_host_keys,
+                                    self._from_host_ca_keys)
+        to_hop = self._encode_hop(self._to_user, self._to_host,
+                                  self._to_host_keys,
+                                  self._to_host_ca_keys)
+
+        return String(String(from_hop) + String(to_hop) + String(b''))
+
+
+def encode_destination_constraints(
+        destinations: Sequence[SSHAgentDestinationConstraint]) -> bytes:
+    """Encode a destination constraint agent extension"""
+
+    return Byte(SSH_AGENT_CONSTRAIN_EXTENSION) + \
+           String(SSH_AGENT_DESTINATION_CONSTRAINT) + \
+           String(b''.join(dest.encode() for dest in destinations))
 
 
 class SSHAgentKeyPair(SSHKeyPair):
@@ -316,10 +444,64 @@ class SSHAgentClient:
         else:
             raise ValueError(f'Unknown SSH agent response: {resptype}')
 
+    async def bind(self, host_key: bytes, session_id: bytes,
+                   signature: bytes, is_forwarding: bool) -> None:
+        """Bind this agent connection to an SSH session
+
+           This method binds the connection to the SSH agent to a
+           particular SSH session, using the OpenSSH
+           ``session-bind@openssh.com`` agent extension. The binding
+           is tied to the server host key and session identifier from
+           the initial key exchange of the session, and is verified by
+           the agent using the signature the server made of the session
+           identifier with that host key during the key exchange.
+
+           Once bound, the agent can enforce per-key destination
+           constraints (see :meth:`add_keys`) on keys used over this
+           connection, ensuring they are only used to authenticate to
+           the destinations those keys were constrained to.
+
+           :param host_key:
+               The encoded public host key of the server, as used in
+               the initial key exchange
+           :param session_id:
+               The session identifier (exchange hash) derived from the
+               initial key exchange
+           :param signature:
+               The server's signature of the session identifier, made
+               with the private key matching `host_key` during the
+               initial key exchange
+           :param is_forwarding:
+               Whether this connection should be bound for agent
+               forwarding (`True`) or user authentication (`False`)
+           :type host_key: `bytes`
+           :type session_id: `bytes`
+           :type signature: `bytes`
+           :type is_forwarding: `bool`
+
+           :raises: :exc:`ValueError` if the agent is unable to verify
+                    or record the session binding
+
+        """
+
+        resptype, resp = await self._make_request(
+            SSH_AGENTC_EXTENSION, String(SSH_AGENT_SESSION_BIND),
+            String(host_key), String(session_id), String(signature),
+            Boolean(is_forwarding))
+
+        if resptype == SSH_AGENT_SUCCESS:
+            resp.check_end()
+        elif resptype in (SSH_AGENT_FAILURE, SSH_AGENT_EXTENSION_FAILURE):
+            raise ValueError('Unable to bind agent connection to SSH session')
+        else:
+            raise ValueError(f'Unknown SSH agent response: {resptype}')
+
     async def add_keys(self, keylist: KeyPairListArg = (),
                        passphrase: Optional[str] = None,
                        lifetime: Optional[int] = None,
-                       confirm: bool = False) -> None:
+                       confirm: bool = False,
+                       destinations: Sequence[SSHAgentDestinationConstraint]
+                           = ()) -> None:
         """Add keys to the agent
 
            This method adds a list of local private keys and optional
@@ -350,10 +532,17 @@ class SSHAgentClient:
            :param confirm: (optional)
                Whether or not to require confirmation for each private
                key operation which uses these keys, defaulting to `False`.
+           :param destinations: (optional)
+               A list of destination constraints to apply to these keys,
+               restricting them to only be usable when authenticating to
+               the specified destinations from an SSH session bound to
+               the agent connection (see :meth:`bind`). By default, keys
+               are not restricted to any particular destinations.
            :type keylist: *see* :ref:`SpecifyingPrivateKeys`
            :type passphrase: `str`
            :type lifetime: `int` or `None`
            :type confirm: `bool`
+           :type destinations: list of :class:`SSHAgentDestinationConstraint`
 
            :raises: :exc:`ValueError` if the keys cannot be added
 
@@ -367,6 +556,9 @@ class SSHAgentClient:
             ignore_failures = True
 
         base_constraints = self.encode_constraints(lifetime, confirm)
+
+        if destinations:
+            base_constraints += encode_destination_constraints(destinations)
 
         provider = os.environ.get('SSH_SK_PROVIDER') or 'internal'
 
@@ -401,7 +593,10 @@ class SSHAgentClient:
     async def add_smartcard_keys(self, provider: str,
                                  pin: Optional[str] = None,
                                  lifetime: Optional[int] = None,
-                                 confirm: bool = False) -> None:
+                                 confirm: bool = False,
+                                 destinations:
+                                     Sequence[SSHAgentDestinationConstraint]
+                                     = ()) -> None:
         """Store keys associated with a smart card in the agent
 
            :param provider:
@@ -415,16 +610,27 @@ class SSHAgentClient:
            :param confirm: (optional)
                Whether or not to require confirmation for each private
                key operation which uses these keys, defaulting to `False`.
+           :param destinations: (optional)
+               A list of destination constraints to apply to these keys,
+               restricting them to only be usable when authenticating to
+               the specified destinations from an SSH session bound to
+               the agent connection (see :meth:`bind`). By default, keys
+               are not restricted to any particular destinations.
            :type provider: `str`
            :type pin: `str` or `None`
            :type lifetime: `int` or `None`
            :type confirm: `bool`
+           :type destinations: list of :class:`SSHAgentDestinationConstraint`
 
            :raises: :exc:`ValueError` if the keys cannot be added
 
         """
 
         constraints = self.encode_constraints(lifetime, confirm)
+
+        if destinations:
+            constraints += encode_destination_constraints(destinations)
+
         msgtype = SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED \
                       if constraints else SSH_AGENTC_ADD_SMARTCARD_KEY
 

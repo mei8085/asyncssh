@@ -90,6 +90,11 @@ class _KexConnectionStub(ConnectionStub):
 
         return b'prefix'
 
+    def record_kex_host_key_sig(self, sig):
+        """Record a host key signature made during key exchange"""
+
+        # pylint: disable=no-self-use
+
     def send_newkeys(self, k, h):
         """Handle a request to send a new keys message"""
 
